@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "agntk"
+name = "eztao"
 version = "0.1.0"
 description = "A toolkit for Active Galactic Nuclei (AGN) time-series analysis."
 authors = ["Weixiang Yu <wy73@drexel.edu>"]
@@ -13,10 +13,10 @@ matplotlib = "^3.3.1"
 toml = "^0.10.1"
 scipy = "^1.5.2"
 pandas = "^1.1.3"
+importlib-metadata = {version = "^2.0.0", python = "<3.8"}
 
 [tool.poetry.dev-dependencies]
 pytest = "^6.0.1"
-jupyterlab =">=2.0.0"
 pytest-cov = "^2.10.1"
 joblib = "^0.17.0"
 

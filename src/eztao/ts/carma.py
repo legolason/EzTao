@@ -4,10 +4,23 @@
 import numpy as np
 from math import ceil
 from scipy.optimize import differential_evolution, minimize
-from celerite import GP
 import celerite
-from agntk.carma.CARMATerm import DRW_term, DHO_term, CARMA_term
-from agntk.lc.utils import *
+from celerite import GP
+from eztao.carma.CARMATerm import DRW_term, DHO_term, CARMA_term
+from eztao.ts.utils import *
+
+__all__ = [
+    "gpSimFull",
+    "gpSimRand",
+    "gpSimByT",
+    "drw_fit",
+    "dho_fit",
+    "carma_fit",
+    "neg_ll",
+    "drw_log_param_init",
+    "dho_log_param_init",
+    "carma_log_param_init",
+]
 
 
 def gpSimFull(carmaTerm, SNR, duration, N, nLC=1):
@@ -66,12 +79,15 @@ def gpSimFull(carmaTerm, SNR, duration, N, nLC=1):
     t = np.repeat(t[None, :], nLC, axis=0)
     y = gp_sim.sample(size=nLC)
 
+    # format yerr
     y_rank = y.argsort(axis=1).argsort(axis=1)
     yerr = np.repeat(yerr[None, :], nLC, axis=0)
     yerr = np.array(list(map(lambda x, y: x[y], yerr, y_rank)))
-    y = y + yerr
+    yerr_sign = np.random.binomial(1, 0.5, yerr.shape)
+    yerr_sign[yerr_sign < 1] = -1
+    yerr = yerr * yerr_sign
 
-    return t, y, yerr
+    return t, y + yerr, yerr
 
 
 def gpSimRand(carmaTerm, SNR, duration, N, nLC=1, season=True, full_N=10_000):
@@ -247,6 +263,135 @@ def carma_log_param_init(dim):
     return log_param
 
 
+def _de_opt(y, yerr, best_fit, gp, init_func, debug, bounds):
+    """Defferential Evolution optimizer wrapper.
+
+    Args:
+        t (object): An array of time stamps in days.
+        y (object): An array of y values.
+        best_fit (object): An empty array to store best fit parameters.
+        gp (object): celerite GP model object.
+        init_func ([type]): CARMA parameter initialization function, 
+            i.e. drw_log_param_init.
+        debug (bool, optional): Turn on/off debug mode.
+        bounds (list): Initial parameter boundaries for the optimizer. 
+
+    Returns:
+        object: An array of best-fit parameters
+    """
+
+    # dynamic control of fitting flow
+    rerun = True
+    succeded = False  # ever succeded
+    run_ct = 0
+    jac_log_rec = 10
+
+    # set bound based on LC std for amp
+    while rerun and (run_ct < 5):
+        run_ct += 1
+        r = differential_evolution(
+            neg_ll, bounds=bounds, args=(y, yerr, gp), maxiter=200
+        )
+
+        if r.success:
+            succeded = True
+            best_fit[:] = np.exp(r.x)
+
+            if "jac" not in r.keys():
+                rerun = False
+            else:
+                jac_log = np.log10(np.dot(r.jac, r.jac) + 1e-8)
+
+                # if positive jac, then increase bounds
+                if jac_log > 0:
+                    bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
+                else:
+                    rerun = False
+
+                # update best-fit if smaller jac found
+                if jac_log < jac_log_rec:
+                    jac_log_rec = jac_log
+                    best_fit[:] = np.exp(r.x)
+        else:
+            bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
+            gp.set_parameter_vector(init_func())
+
+    # If opitimizer never reached minima, assign nan
+    if not succeded:
+        best_fit[:] = np.nan
+
+    # Below code is used to visualize if stuck in local minima
+    if debug:
+        print(r)
+
+    return best_fit
+
+
+def _min_opt(y, yerr, best_fit, gp, init_func, debug, bounds, method="L-BFGS-B"):
+    """A wrapper for scipy.optimize.minimize.
+
+    Args:
+        t (object): An array of time stamps in days.
+        y (object): An array of y values.
+        best_fit (object): An empty array to store best fit parameters.
+        gp (object): celerite GP model object.
+        init_func ([type]): CARMA parameter initialization function, 
+            i.e. drw_log_param_init.
+        debug (bool, optional): Turn on/off debug mode.
+        bounds (list): Initial parameter boundaries for the optimizer. 
+        method (str): Likelihood optimization method. 
+
+    Returns:
+        object: An array of best-fit parameters
+    """
+
+    # dynamic control of fitting flow
+    rerun = True
+    succeded = False  # ever succeded
+    run_ct = 0
+    jac_log_rec = 10
+    initial_params = gp.get_parameter_vector()
+
+    # set bound based on LC std for amp
+    while rerun and (run_ct < 5):
+        run_ct += 1
+        r = minimize(
+            neg_ll, initial_params, method=method, bounds=bounds, args=(y, yerr, gp),
+        )
+        if r.success:
+            succeded = True
+            best_fit[:] = np.exp(r.x)
+
+            if "jac" not in r.keys():
+                rerun = False
+            else:
+                jac_log = np.log10(np.dot(r.jac, r.jac) + 1e-8)
+
+                # if positive jac, then increase bounds
+                if jac_log > 0:
+                    bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
+                else:
+                    rerun = False
+
+                # update best-fit if smaller jac found
+                if jac_log < jac_log_rec:
+                    jac_log_rec = jac_log
+                    best_fit[:] = np.exp(r.x)
+        else:
+            bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
+            gp.set_parameter_vector(init_func())
+
+    # If opitimizer never reached minima, assign nan
+    if not succeded:
+        best_fit[:] = np.nan
+
+    # Below code is used to visualize if stuck in local minima
+    if debug:
+        print(r)
+
+    return best_fit
+
+
 def drw_fit(t, y, yerr, debug=False, user_bounds=None):
     """Fix time series to DRW model
 
@@ -276,17 +421,12 @@ def drw_fit(t, y, yerr, debug=False, user_bounds=None):
     y = y - np.median(y)
 
     # dynamic control of fitting flow
-    rerun = True
     compute = True  # handle can't factorize in gp.compute()
-    succeded = False  # ever succeded
     compute_ct = 0
-    counter = 0
-    jac_log_rec = 10
 
     # initialize parameter and kernel
     kernel = DRW_term(*drw_log_param_init(std))
     gp = GP(kernel, mean=np.median(y))
-    gp.compute(t, yerr)
 
     # compute can't factorize, try 4 more times
     while compute & (compute_ct < 5):
@@ -297,45 +437,11 @@ def drw_fit(t, y, yerr, debug=False, user_bounds=None):
         except celerite.solver.LinAlgError:
             gp.set_parameter_vector(drw_log_param_init(std))
 
-    # set bound based on LC std for amp
-    while rerun and (counter < 5):
-        counter += 1
-        r = differential_evolution(
-            neg_ll, bounds=bounds, args=(y, yerr, gp), maxiter=200
-        )
+    best_fit_return = _de_opt(
+        y, yerr, best_fit, gp, lambda: drw_log_param_init(std), debug, bounds,
+    )
 
-        if r.success:
-            succeded = True
-            best_fit[:] = np.exp(r.x)
-
-            if "jac" not in r.keys():
-                rerun = False
-            else:
-                jac_log = np.log10(np.dot(r.jac, r.jac) + 1e-8)
-
-                # if positive jac, then increase bounds
-                if jac_log > 0:
-                    bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-                else:
-                    rerun = False
-
-                # update best-fit if smaller jac found
-                if jac_log < jac_log_rec:
-                    jac_log_rec = jac_log
-                    best_fit[:] = np.exp(r.x)
-        else:
-            bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-            gp.set_parameter_vector(drw_log_param_init(std))
-
-    # If opitimizer never reached minima, assign nan
-    if not succeded:
-        best_fit[:] = np.nan
-
-    # Below code is used to visualize if stuck in local minima
-    if debug:
-        print(r)
-
-    return best_fit
+    return best_fit_return
 
 
 def dho_fit(t, y, yerr, debug=False, user_bounds=None):
@@ -364,12 +470,8 @@ def dho_fit(t, y, yerr, debug=False, user_bounds=None):
     y = y - np.median(y)
 
     # dynamic control of fitting flow
-    rerun = True
     compute = True  # handle can't factorize in gp.compute()
-    succeded = False  # ever succeded
     compute_ct = 0
-    counter = 0
-    jac_log_rec = 10
 
     # initialize parameter, kernel and GP
     kernel = DHO_term(*dho_log_param_init())
@@ -384,45 +486,11 @@ def dho_fit(t, y, yerr, debug=False, user_bounds=None):
         except celerite.solver.LinAlgError:
             gp.set_parameter_vector(dho_log_param_init())
 
-    # set bound based on LC std for amp
-    while rerun and (counter < 5):
-        counter += 1
-        r = differential_evolution(
-            neg_ll, bounds=bounds, args=(y, yerr, gp), maxiter=200
-        )
+    best_fit_return = _de_opt(
+        y, yerr, best_fit, gp, lambda: dho_log_param_init(), debug, bounds,
+    )
 
-        if r.success:
-            succeded = True
-            best_fit[:] = np.exp(r.x)
-
-            if "jac" not in r.keys():
-                rerun = False
-            else:
-                jac_log = np.log10(np.dot(r.jac, r.jac) + 1e-8)
-
-                # if positive jac, then increase bounds
-                if jac_log > 0:
-                    bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-                else:
-                    rerun = False
-
-                # update best-fit if smaller jac found
-                if jac_log < jac_log_rec:
-                    jac_log_rec = jac_log
-                    best_fit[:] = np.exp(r.x)
-        else:
-            bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-            gp.set_parameter_vector(dho_log_param_init())
-
-    # If opitimizer never reached minima, assign nan
-    if not succeded:
-        best_fit[:] = np.nan
-
-    # Below code is used to visualize if stuck in local minima
-    if debug:
-        print(r)
-
-    return best_fit
+    return best_fit_return
 
 
 def carma_fit(t, y, yerr, p, q, de=True, debug=False, user_bounds=None):
@@ -457,12 +525,8 @@ def carma_fit(t, y, yerr, p, q, de=True, debug=False, user_bounds=None):
     y = y - np.median(y)
 
     # dynamic control of fitting flow
-    rerun = True
     compute = True  # handle can't factorize in gp.compute()
-    succeded = False  # ever succeded
     compute_ct = 0
-    counter = 0
-    jac_log_rec = 10
 
     # initialize parameter and kernel
     carma_log_params = carma_log_param_init(dim)
@@ -479,77 +543,12 @@ def carma_fit(t, y, yerr, p, q, de=True, debug=False, user_bounds=None):
             gp.set_parameter_vector(carma_log_param_init(dim))
 
     if de:
-        # set bound based on LC std for amp
-        while rerun and (counter < 5):
-            counter += 1
-            r = differential_evolution(
-                neg_ll, bounds=bounds, args=(y, yerr, gp), maxiter=200
-            )
-
-            if r.success:
-                succeded = True
-                best_fit[:] = np.exp(r.x)
-
-                if "jac" not in r.keys():
-                    rerun = False
-                else:
-                    jac_log = np.log10(np.dot(r.jac, r.jac) + 1e-8)
-
-                    # if positive jac, then increase bounds
-                    if jac_log > 0:
-                        bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-                    else:
-                        rerun = False
-
-                    # update best-fit if smaller jac found
-                    if jac_log < jac_log_rec:
-                        jac_log_rec = jac_log
-                        best_fit[:] = np.exp(r.x)
-            else:
-                bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-                gp.set_parameter_vector(carma_log_param_init(dim))
-
+        best_fit_return = _de_opt(
+            y, yerr, best_fit, gp, lambda: carma_log_param_init(dim), debug, bounds,
+        )
     else:
-        initial_params = gp.get_parameter_vector()
+        best_fit_return = _min_opt(
+            y, yerr, best_fit, gp, lambda: carma_log_param_init(dim), debug, bounds,
+        )
 
-        while rerun and (counter < 5):
-            counter += 1
-            r = minimize(
-                neg_ll,
-                initial_params,
-                method="L-BFGS-B",
-                bounds=bounds,
-                args=(y, yerr, gp),
-            )
-            if r.success:
-                succeded = True
-                best_fit[:] = np.exp(r.x)
-
-                if "jac" not in r.keys():
-                    rerun = False
-                else:
-                    jac_log = np.log10(np.dot(r.jac, r.jac) + 1e-8)
-
-                    # if positive jac, then increase bounds
-                    if jac_log > 0:
-                        bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-                    else:
-                        rerun = False
-
-                    # update best-fit if smaller jac found
-                    if jac_log < jac_log_rec:
-                        jac_log_rec = jac_log
-                        best_fit[:] = np.exp(r.x)
-            else:
-                bounds = [(x[0] - 1, x[1] + 1) for x in bounds]
-                gp.set_parameter_vector(carma_log_param_init(dim))
-
-    # If opitimizer never reached minima, assign nan
-    if not succeded:
-        best_fit[:] = np.nan
-
-    # Below code is used to visualize if stuck in local minima
-    if debug:
-        print(r)
-
-    return best_fit
+    return best_fit_return
